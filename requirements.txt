@@ -1,0 +1,8 @@
+mne
+scipy
+numpy
+matplotlib
+scikit-learn
+seaborn
+h5py
+jupyter
