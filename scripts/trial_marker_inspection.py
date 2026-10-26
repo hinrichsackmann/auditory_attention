@@ -175,3 +175,7 @@ with h5py.File('data/raw/S1.mat', 'r') as f:
                 print(f"  {key}: [Group]")
     elif isinstance(raw, h5py.Dataset):
         print(f"  Direct dataset: shape={raw.shape}, dtype={raw.dtype}")
+
+    print("HighPass:", scalar(trial['RawData']['HighPass']))
+    print("FilterOrder:", scalar(trial['RawData']['FilterOrder']))
+    print("TriggerAlignmentShift:", scalar(trial['RawData']['TriggerAlignmentShift']))

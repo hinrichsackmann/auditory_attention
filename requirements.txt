@@ -6,3 +6,5 @@ scikit-learn
 seaborn
 h5py
 jupyter
+librosa
+pandas

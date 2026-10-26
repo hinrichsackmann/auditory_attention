@@ -8,12 +8,18 @@ file's shared '#refs#' group, which this module dereferences recursively.
 
 from __future__ import annotations
 
+from math import gcd
 from pathlib import Path
 from typing import Union
 
 import h5py
+import librosa
 import mne
 import numpy as np
+from scipy.signal import butter, hilbert, resample_poly, sosfiltfilt
+
+_ENVELOPE_BAND_HZ = (80, 3000)
+_ENVELOPE_FILTER_ORDER = 4
 
 _INTERNAL_GROUPS = {"#refs#"}
 _REF_DTYPE = h5py.special_dtype(ref=h5py.Reference)
@@ -187,7 +193,138 @@ def load_subject(subject_id: Union[int, str], data_dir: Union[str, Path]) -> mne
     return raw
 
 
+def decode_str(arr) -> str:
+    """Decode a MATLAB char array (stored as uint16 codepoints) to a string."""
+    return "".join(chr(int(c)) for c in np.asarray(arr).ravel())
+
+
+def _extract_envelope(audio: np.ndarray, audio_fs: float, target_fs: float) -> np.ndarray:
+    """Bandpass (80-3000 Hz, 4th-order Butterworth) -> Hilbert envelope -> resample."""
+    sos = butter(_ENVELOPE_FILTER_ORDER, _ENVELOPE_BAND_HZ, btype="bandpass",
+                 fs=audio_fs, output="sos")
+    filtered = sosfiltfilt(sos, audio)
+    envelope = np.abs(hilbert(filtered))
+
+    g = gcd(round(target_fs), round(audio_fs))
+    up, down = round(target_fs) // g, round(audio_fs) // g
+    return resample_poly(envelope, up, down)
+
+
+def load_trial(filepath: Union[str, Path], trial_idx: int,
+               stimuli_dir: Union[str, Path], extract_envelope: bool = True) -> dict:
+    """
+    Load one trial's EEG together with its attended/unattended audio.
+
+    Parameters
+    ----------
+    filepath : path to a subject .mat file (MATLAB v7.3 / HDF5).
+    trial_idx : index into the ``trials`` cell array (0-19).
+    stimuli_dir : directory holding the stimulus .wav files
+        (``data/raw/stimuli``).
+    extract_envelope : if True (default), the attended/unattended audio is
+        bandpass filtered (80-3000 Hz, 4th-order Butterworth), Hilbert-
+        enveloped, and resampled to the EEG sample rate, truncated to
+        ``eeg.shape[1]`` samples per the README (audio runs longer than the
+        EEG per trial). Each envelope is then trimmed at the front by
+        ``RawData.TriggerAlignmentShift`` samples to correct the EEG/audio
+        trigger lag, and ``eeg`` is trimmed to match -- so both ``eeg`` and
+        the envelopes are shorter than ``eeg.shape[1]`` before this shift.
+        If False, the raw loaded audio is returned instead, for debugging
+        (no shift applied).
+
+    Returns
+    -------
+    dict with keys ``eeg`` (64, n_samples, in microvolts as stored, in the
+    standard BioSemi 10-20 channel order matching MNE's "biosemi64" montage
+    -- see `preprocessing.make_raw`), ``fs``, ``attended_track``,
+    ``attended_ear``, ``trial_id``, ``subject``, the two stimulus filenames, and either
+    ``envelope_attended``/``envelope_unattended`` (n_samples, at ``fs``,
+    lag-corrected and length-matched to ``eeg``) when `extract_envelope` is
+    True, or ``audio_attended``/``audio_unattended``/``audio_fs`` when False.
+    """
+    stimuli_dir = Path(stimuli_dir)
+
+    with h5py.File(filepath, "r") as f:
+        trial = f[f["trials"][trial_idx, 0]]
+
+        eeg = np.asarray(trial["RawData"]["EegData"][()])
+        fs = float(scalar(trial["FileHeader"]["SampleRate"]))
+        attended_track = int(scalar(trial["attended_track"]))
+        attended_ear = decode_str(trial["attended_ear"][()])
+        trial_id = int(scalar(trial["TrialID"]))
+        subject = decode_str(trial["subject"][()])
+        trigger_alignment_shift = int(scalar(trial["RawData"]["TriggerAlignmentShift"]))
+
+        stim_names = [decode_str(f[trial["stimuli"][0, i]][()]) for i in (0, 1)]
+
+    # stimuli[0]/stimuli[1] are the files played in the LEFT/RIGHT ear (README),
+    # so attention is resolved by ear. attended_track is the story track, which
+    # matches the ear-selected file only on half the trials.
+    attended_idx = 0 if attended_ear == "L" else 1
+    attended_name = stim_names[attended_idx]
+    unattended_name = stim_names[1 - attended_idx]
+
+    audio_attended, audio_fs = librosa.load(stimuli_dir / attended_name, sr=None)
+    audio_unattended, _ = librosa.load(stimuli_dir / unattended_name, sr=None)
+
+    result = {
+        "eeg": eeg,
+        "fs": fs,
+        "attended_track": attended_track,
+        "attended_ear": attended_ear,
+        "trial_id": trial_id,
+        "subject": subject,
+        "audio_attended_file": attended_name,
+        "audio_unattended_file": unattended_name,
+    }
+
+    if extract_envelope:
+        n_samples = eeg.shape[1]
+        envelope_attended = _extract_envelope(audio_attended, audio_fs, fs)[:n_samples]
+        envelope_unattended = _extract_envelope(audio_unattended, audio_fs, fs)[:n_samples]
+
+        # Correct the EEG/audio trigger lag: trim the front of each envelope,
+        # then match the EEG length to the (now shorter) shifted envelope.
+        shift = trigger_alignment_shift
+        envelope_attended = envelope_attended[shift:]
+        envelope_unattended = envelope_unattended[shift:]
+        eeg = eeg[:, :envelope_attended.shape[0]]
+
+        result["eeg"] = eeg
+        result["envelope_attended"] = envelope_attended
+        result["envelope_unattended"] = envelope_unattended
+    else:
+        result["audio_attended"] = audio_attended
+        result["audio_unattended"] = audio_unattended
+        result["audio_fs"] = int(audio_fs)
+
+    return result
+
+
+def load_subject_trials(filepath: Union[str, Path],
+                        stimuli_dir: Union[str, Path]) -> list:
+    """
+    Load every trial of one subject via `load_trial`, returning a list of dicts.
+
+    Named to avoid colliding with `load_subject`, which returns a continuous
+    MNE Raw for the filtering/ICA pipeline instead.
+    """
+    with h5py.File(filepath, "r") as f:
+        n_trials = f["trials"].shape[0]
+
+    return [load_trial(filepath, i, stimuli_dir) for i in range(n_trials)]
+
+
 if __name__ == "__main__":
-    DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
-    raw = load_subject(1, DATA_DIR)
-    print(raw.info)
+    RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
+    trial = load_trial(RAW_DIR / "S1.mat", 0, RAW_DIR / "stimuli")
+
+    print(f"subject:          {trial['subject']}")
+    print(f"trial_id:         {trial['trial_id']}")
+    print(f"attended_ear:     {trial['attended_ear']}")
+    print(f"attended_track:   {trial['attended_track']}")
+    print(f"eeg:                shape={trial['eeg'].shape}, fs={trial['fs']} Hz")
+    print(f"envelope_attended:  shape={trial['envelope_attended'].shape}  "
+          f"<- {trial['audio_attended_file']}")
+    print(f"envelope_unattended: shape={trial['envelope_unattended'].shape}  "
+          f"<- {trial['audio_unattended_file']}")

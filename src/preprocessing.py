@@ -8,11 +8,23 @@ from typing import Optional, Sequence, Union
 import mne
 import numpy as np
 
+from loading import load_subject_trials
+
 _FILTER_PARAMS = {
     "ica_prep": {"l_freq": 1.0, "h_freq": None},
     "analysis": {"l_freq": 1.0, "h_freq": 8.0},
 }
 _ANALYSIS_RESAMPLE_FREQ = 64.0
+
+# The source .mat files are already hardware/amplifier high-pass filtered at
+# 0.5 Hz (RawData.HighPass; README: "Each trial was high-pass filtered (0.5 Hz
+# cut off)..."), so content below 0.5 Hz is already gone before we see it.
+# MNE's default transition band for a 1 Hz 'auto' high-pass extends all the
+# way down to 0 Hz (-6 dB point at 0.5 Hz), i.e. it's designed as if the
+# input were unfiltered full-spectrum data. We instead set an explicit,
+# narrower transition band so our filter's stopband starts at (not below)
+# the hardware cutoff, rather than re-filtering a region that's already gone.
+_HARDWARE_HIGHPASS_HZ = 0.5
 
 
 def filter_raw(raw: mne.io.BaseRaw, kind: str) -> mne.io.BaseRaw:
@@ -31,7 +43,9 @@ def filter_raw(raw: mne.io.BaseRaw, kind: str) -> mne.io.BaseRaw:
 
     filtered = raw.copy()
     params = _FILTER_PARAMS[kind]
-    filtered.filter(l_freq=params["l_freq"], h_freq=params["h_freq"], fir_design="firwin")
+    l_trans_bandwidth = params["l_freq"] - _HARDWARE_HIGHPASS_HZ
+    filtered.filter(l_freq=params["l_freq"], h_freq=params["h_freq"], fir_design="firwin",
+                     l_trans_bandwidth=l_trans_bandwidth)
 
     if kind == "analysis":
         filtered.resample(_ANALYSIS_RESAMPLE_FREQ)
@@ -39,6 +53,36 @@ def filter_raw(raw: mne.io.BaseRaw, kind: str) -> mne.io.BaseRaw:
     filtered, _ = mne.set_eeg_reference(filtered, "average")
 
     return filtered
+
+
+def make_raw(trial: dict) -> mne.io.RawArray:
+    """
+    Convert one `loading.load_trial` dict into an MNE Raw, so it can be fed
+    into `filter_raw` / `fit_ica` / `apply_ica` exactly like `load_subject`'s
+    continuous Raw.
+
+    Channel names come from `mne.channels.make_standard_montage("biosemi64")`
+    directly rather than from the trial dict (this dataset's own channel
+    order matches that montage order exactly, as used elsewhere in this
+    project), so this only needs ``eeg`` and ``fs`` from `trial`. An average
+    EEG reference projection is added but not applied -- call
+    `raw.apply_proj()` (or let a downstream MNE operation apply it) when ready.
+
+    Parameters
+    ----------
+    trial : a dict as returned by `loading.load_trial` (needs ``eeg`` and ``fs``).
+
+    Returns
+    -------
+    mne.io.RawArray with the "biosemi64" montage set and an unapplied
+    average EEG reference projection.
+    """
+    montage = mne.channels.make_standard_montage("biosemi64")
+    info = mne.create_info(ch_names=montage.ch_names, sfreq=trial["fs"], ch_types="eeg")
+    raw = mne.io.RawArray(trial["eeg"] * 1e-6, info)  # stored in microvolts; MNE expects volts
+    raw.set_montage(montage)
+    raw.set_eeg_reference("average", projection=True)
+    return raw
 
 
 def fit_ica(raw_hp: mne.io.BaseRaw, n_components: int = 20,
@@ -62,7 +106,7 @@ def fit_ica(raw_hp: mne.io.BaseRaw, n_components: int = 20,
     mne.preprocessing.ICA, fitted, with `.exclude` set to the detected
     EOG-related components.
     """
-    ica = mne.preprocessing.ICA(n_components=n_components, max_iter="auto", rng=97)
+    ica = mne.preprocessing.ICA(n_components=n_components, max_iter="auto", random_state=97)
     ica.fit(raw_hp)
 
     eog_indices, _ = ica.find_bads_eog(raw_hp, ch_name="Fp1")
@@ -74,6 +118,11 @@ def fit_ica(raw_hp: mne.io.BaseRaw, n_components: int = 20,
         ica.save(save_path, overwrite=True)
 
     return ica
+
+
+def load_ica(path: Union[str, Path]) -> mne.preprocessing.ICA:
+    """Load an ICA solution saved by `fit_ica(..., save_path=...)`, without refitting."""
+    return mne.preprocessing.read_ica(path)
 
 
 def apply_ica(raw_analysis: mne.io.BaseRaw, ica: mne.preprocessing.ICA,
@@ -167,3 +216,55 @@ def load_cleaned_raw(subject_id: Union[int, str], processed_dir: Union[str, Path
     """
     path = checkpoint_path(subject_id, processed_dir)
     return mne.io.read_raw_fif(path, preload=True)
+
+
+def run_subject(subject_id: Union[int, str], mat_path: Union[str, Path],
+                 stimuli_dir: Union[str, Path], processed_dir: Union[str, Path],
+                 ica_dir: Union[str, Path]) -> Path:
+    """
+    Run the full per-subject pipeline from raw trials to a saved, cleaned
+    checkpoint: load every trial, build and concatenate a continuous Raw,
+    fit ICA (saved to disk), filter for analysis, apply ICA, and save the
+    cleaned checkpoint.
+
+    Parameters
+    ----------
+    subject_id : subject number, e.g. ``1`` or ``"1"`` or ``"S1"``.
+    mat_path : path to the subject's .mat file.
+    stimuli_dir : directory holding the stimulus .wav files.
+    processed_dir : directory to save the cleaned Raw checkpoint into
+        (see `save_cleaned_raw`).
+    ica_dir : directory to save the fitted ICA into, as ``sub{id:02d}-ica.fif``.
+
+    Returns
+    -------
+    Path to the saved, cleaned Raw checkpoint.
+    """
+    subject_num = int(str(subject_id).lstrip("Ss"))
+    tag = f"run_subject {subject_num}"
+
+    print(f"{tag}: loading trials from {mat_path}...")
+    trials = load_subject_trials(mat_path, stimuli_dir)
+
+    print(f"{tag}: building and concatenating {len(trials)} trial Raw(s)...")
+    raw = mne.concatenate_raws([make_raw(t) for t in trials])
+
+    print(f"{tag}: high-pass filtering for ICA...")
+    raw_hp = filter_raw(raw, "ica_prep")
+
+    print(f"{tag}: fitting ICA...")
+    ica_path = Path(ica_dir) / f"sub{subject_num:02d}-ica.fif"
+    ica_path.parent.mkdir(parents=True, exist_ok=True)
+    ica = fit_ica(raw_hp, save_path=ica_path)
+
+    print(f"{tag}: band-pass filtering for analysis...")
+    raw_analysis = filter_raw(raw, "analysis")
+
+    print(f"{tag}: applying ICA...")
+    cleaned = apply_ica(raw_analysis, ica)
+
+    print(f"{tag}: saving cleaned checkpoint...")
+    path = save_cleaned_raw(cleaned, subject_num, processed_dir)
+
+    print(f"{tag}: done -> {path}")
+    return path
