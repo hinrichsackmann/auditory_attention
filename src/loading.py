@@ -21,6 +21,12 @@ from scipy.signal import butter, hilbert, resample_poly, sosfiltfilt
 _ENVELOPE_BAND_HZ = (80, 3000)
 _ENVELOPE_FILTER_ORDER = 4
 
+# EEG is resampled to this rate for analysis (see preprocessing.filter_raw's
+# "analysis" kind); envelopes default to the same rate so they line up with
+# the cleaned EEG. Kept here (not in preprocessing.py) since preprocessing.py
+# already imports from loading.py, and this avoids a circular import.
+_ANALYSIS_RESAMPLE_FREQ = 64.0
+
 _INTERNAL_GROUPS = {"#refs#"}
 _REF_DTYPE = h5py.special_dtype(ref=h5py.Reference)
 _VALUE_PREVIEW_MAX_ELEMENTS = 20
@@ -211,7 +217,9 @@ def _extract_envelope(audio: np.ndarray, audio_fs: float, target_fs: float) -> n
 
 
 def load_trial(filepath: Union[str, Path], trial_idx: int,
-               stimuli_dir: Union[str, Path], extract_envelope: bool = True) -> dict:
+               stimuli_dir: Union[str, Path], extract_envelope: bool = True,
+               target_fs: float = _ANALYSIS_RESAMPLE_FREQ,
+               apply_trigger_shift: bool = False) -> dict:
     """
     Load one trial's EEG together with its attended/unattended audio.
 
@@ -223,24 +231,38 @@ def load_trial(filepath: Union[str, Path], trial_idx: int,
         (``data/raw/stimuli``).
     extract_envelope : if True (default), the attended/unattended audio is
         bandpass filtered (80-3000 Hz, 4th-order Butterworth), Hilbert-
-        enveloped, and resampled to the EEG sample rate, truncated to
-        ``eeg.shape[1]`` samples per the README (audio runs longer than the
-        EEG per trial). Each envelope is then trimmed at the front by
-        ``RawData.TriggerAlignmentShift`` samples to correct the EEG/audio
-        trigger lag, and ``eeg`` is trimmed to match -- so both ``eeg`` and
-        the envelopes are shorter than ``eeg.shape[1]`` before this shift.
-        If False, the raw loaded audio is returned instead, for debugging
-        (no shift applied).
+        enveloped, and resampled to `target_fs`, truncated to match the
+        trial's EEG duration per the README (audio runs longer than the EEG
+        per trial). If False, the raw loaded audio is returned instead, for
+        debugging.
+    target_fs : sample rate the envelopes are resampled to. Defaults to
+        `_ANALYSIS_RESAMPLE_FREQ` (64 Hz), matching the rate EEG ends up at
+        after `preprocessing.filter_raw(..., "analysis")`, so envelope and
+        (separately-processed) cleaned EEG line up. ``eeg`` in the returned
+        dict stays at its native rate (``fs``) regardless -- this only
+        controls the envelope's rate.
+    apply_trigger_shift : if True, trims `eeg` and the envelopes by
+        `RawData.TriggerAlignmentShift` samples, as an EEG/audio sync
+        correction. UNVERIFIED: the value is a constant 10 across every
+        trial checked (S1, S8, S16; 60 trials total), and neither the
+        dataset README nor preprocess_data.m mentions this field -- a
+        constant across every trial/subject is inconsistent with it being a
+        measured per-trial lag, and more consistent with a fixed
+        filter/decimation artifact from the dataset's own stated 0.5 Hz
+        high-pass + 8192->128 Hz downsampling step. Defaults to False (no
+        trim) until this is confirmed against the KUL dataset paper or its
+        authors -- see PLAN.md's "Decisions to hold fixed" table, row
+        "Trigger shift".
 
     Returns
     -------
     dict with keys ``eeg`` (64, n_samples, in microvolts as stored, in the
     standard BioSemi 10-20 channel order matching MNE's "biosemi64" montage
     -- see `preprocessing.make_raw`), ``fs``, ``attended_track``,
-    ``attended_ear``, ``trial_id``, ``subject``, the two stimulus filenames, and either
-    ``envelope_attended``/``envelope_unattended`` (n_samples, at ``fs``,
-    lag-corrected and length-matched to ``eeg``) when `extract_envelope` is
-    True, or ``audio_attended``/``audio_unattended``/``audio_fs`` when False.
+    ``attended_ear``, ``trial_id``, ``subject``, the two stimulus filenames,
+    and either ``envelope_attended``/``envelope_unattended`` (n_samples, at
+    ``envelope_fs``) when `extract_envelope` is True, or
+    ``audio_attended``/``audio_unattended``/``audio_fs`` when False.
     """
     stimuli_dir = Path(stimuli_dir)
 
@@ -279,20 +301,22 @@ def load_trial(filepath: Union[str, Path], trial_idx: int,
     }
 
     if extract_envelope:
-        n_samples = eeg.shape[1]
-        envelope_attended = _extract_envelope(audio_attended, audio_fs, fs)[:n_samples]
-        envelope_unattended = _extract_envelope(audio_unattended, audio_fs, fs)[:n_samples]
+        max_env_samples = round(eeg.shape[1] * target_fs / fs)
+        envelope_attended = _extract_envelope(audio_attended, audio_fs, target_fs)[:max_env_samples]
+        envelope_unattended = _extract_envelope(audio_unattended, audio_fs, target_fs)[:max_env_samples]
 
-        # Correct the EEG/audio trigger lag: trim the front of each envelope,
-        # then match the EEG length to the (now shorter) shifted envelope.
-        shift = trigger_alignment_shift
-        envelope_attended = envelope_attended[shift:]
-        envelope_unattended = envelope_unattended[shift:]
-        eeg = eeg[:, :envelope_attended.shape[0]]
+        if apply_trigger_shift:
+            # trigger_alignment_shift is in native-EEG-rate (fs) sample units;
+            # rescale for the envelopes, which may be at a different rate.
+            shift_env = round(trigger_alignment_shift * target_fs / fs)
+            envelope_attended = envelope_attended[shift_env:]
+            envelope_unattended = envelope_unattended[shift_env:]
+            eeg = eeg[:, trigger_alignment_shift:]
 
         result["eeg"] = eeg
         result["envelope_attended"] = envelope_attended
         result["envelope_unattended"] = envelope_unattended
+        result["envelope_fs"] = target_fs
     else:
         result["audio_attended"] = audio_attended
         result["audio_unattended"] = audio_unattended
@@ -301,18 +325,26 @@ def load_trial(filepath: Union[str, Path], trial_idx: int,
     return result
 
 
-def load_subject_trials(filepath: Union[str, Path],
-                        stimuli_dir: Union[str, Path]) -> list:
+def load_subject_trials(filepath: Union[str, Path], stimuli_dir: Union[str, Path],
+                        extract_envelope: bool = True) -> list:
     """
     Load every trial of one subject via `load_trial`, returning a list of dicts.
 
     Named to avoid colliding with `load_subject`, which returns a continuous
     MNE Raw for the filtering/ICA pipeline instead.
+
+    Parameters
+    ----------
+    extract_envelope : passed through to `load_trial`. Set False when only
+        EEG is needed (e.g. ICA fitting) -- envelope extraction (bandpass +
+        Hilbert + resample on both audio files, per trial) is one of the
+        slower parts of loading a subject and is otherwise wasted work.
     """
     with h5py.File(filepath, "r") as f:
         n_trials = f["trials"].shape[0]
 
-    return [load_trial(filepath, i, stimuli_dir) for i in range(n_trials)]
+    return [load_trial(filepath, i, stimuli_dir, extract_envelope=extract_envelope)
+            for i in range(n_trials)]
 
 
 if __name__ == "__main__":
@@ -323,8 +355,8 @@ if __name__ == "__main__":
     print(f"trial_id:         {trial['trial_id']}")
     print(f"attended_ear:     {trial['attended_ear']}")
     print(f"attended_track:   {trial['attended_track']}")
-    print(f"eeg:                shape={trial['eeg'].shape}, fs={trial['fs']} Hz")
-    print(f"envelope_attended:  shape={trial['envelope_attended'].shape}  "
-          f"<- {trial['audio_attended_file']}")
-    print(f"envelope_unattended: shape={trial['envelope_unattended'].shape}  "
-          f"<- {trial['audio_unattended_file']}")
+    print(f"eeg:                 shape={trial['eeg'].shape}, fs={trial['fs']} Hz")
+    print(f"envelope_attended:   shape={trial['envelope_attended'].shape}, "
+          f"fs={trial['envelope_fs']} Hz  <- {trial['audio_attended_file']}")
+    print(f"envelope_unattended: shape={trial['envelope_unattended'].shape}, "
+          f"fs={trial['envelope_fs']} Hz  <- {trial['audio_unattended_file']}")
